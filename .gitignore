@@ -1,0 +1,38 @@
+# Arquivos de credenciais e configuracao local da AWS — NUNCA commitar
+.env
+.env.*
+*.env
+aws-exports.js
+credentials
+config
+
+# Artefatos gerados pelo AWS SAM e CDK
+.aws-sam/
+cdk.out/
+samconfig.toml
+
+# Templates empacotados pelo CloudFormation (aws cloudformation package)
+packaged-*.yaml
+packaged-*.json
+*.packaged.yaml
+*.packaged.json
+
+# Node.js (caso use CDK ou ferramentas JS)
+node_modules/
+package-lock.json
+
+# Python (caso use CDK Python ou scripts de deploy)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Sistema operacional
+.DS_Store
+Thumbs.db

@@ -1,0 +1,2169 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Internet Brasil - Producao - VPC, ECS Fargate, ALB, RDS MySQL 8.0 e Auto Scaling'
+
+# ============================================================
+# Parameters
+# ============================================================
+
+Parameters:
+
+  ACMCertificateArn:
+    Type: String
+    Description: ARN do certificado ACM para o listener HTTPS (porta 443)
+
+  DBMasterUsername:
+    Type: String
+    Description: >
+      Usuario master do RDS MySQL. Evite nomes obvios como "admin", "root" ou "master" —
+      sao os primeiros testados em ataques de forca bruta caso haja pivoting interno.
+    # Default removido intencionalmente — o operador deve escolher um username conscientemente.
+    MinLength: 1
+    MaxLength: 16
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+
+  AppImageTag:
+    Type: String
+    Description: >
+      Tag imutavel da imagem Docker (SHA do commit ou versao semantica).
+      Exemplos validos: sha-a1b2c3d ou v2.1.0. NUNCA use "latest" em producao —
+      com o repositorio ECR configurado como IMMUTABLE, "latest" causaria falha no deploy
+      alem de impossibilitar rastreabilidade e rollback confiavel.
+    # Default removido — exige passagem explicita em todo deploy, forçando decisao consciente.
+    AllowedPattern: '^(v[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?|sha-[a-f0-9]{7,40})$'
+    ConstraintDescription: 'Use v1.2.3 ou sha-abc1234 — nunca latest ou outras tags informais'
+
+  DBInstanceClass:
+    Type: String
+    Description: >
+      Classe da instancia RDS. db.t3.micro e adequado apenas para dev/test.
+      Para producao com carga real, use db.t3.small no minimo.
+    Default: db.t3.small
+    AllowedValues:
+      - db.t3.small
+      - db.t3.medium
+      - db.t3.large
+      - db.r6g.large
+      - db.r6g.xlarge
+
+  DBAllocatedStorageGB:
+    Type: Number
+    Description: Armazenamento inicial do RDS em GB.
+    Default: 50
+    MinValue: 20
+    MaxValue: 1000
+
+  ECSTaskCpu:
+    Type: String
+    Description: CPU da task ECS (256=0.25vCPU, 512=0.5vCPU, 1024=1vCPU).
+    Default: '512'
+    AllowedValues: ['256', '512', '1024', '2048', '4096']
+
+  ECSTaskMemory:
+    Type: String
+    Description: Memoria da task ECS em MB.
+    Default: '1024'
+    AllowedValues: ['512', '1024', '2048', '4096', '8192']
+
+  AlarmEmail:
+    Type: String
+    Description: >
+      E-mail para receber alertas do CloudWatch. Deixe em branco para nao configurar e-mail.
+    Default: ''
+
+# ============================================================
+# Mappings
+# ============================================================
+
+Mappings:
+  # IDs de conta do servico ELB por regiao — necessarios para a politica do bucket
+  # de access logs do ALB em regioes antigas (pre-2022). Regioes mais novas usam
+  # o service principal delivery.logs.amazonaws.com; incluimos ambas as abordagens.
+  ELBServiceAccounts:
+    us-east-1:
+      AccountId: '127311923021'
+    us-east-2:
+      AccountId: '033677994240'
+    us-west-1:
+      AccountId: '027434742980'
+    us-west-2:
+      AccountId: '797873946194'
+    sa-east-1:
+      AccountId: '507241528517'
+    eu-west-1:
+      AccountId: '156460612806'
+    eu-west-2:
+      AccountId: '652711504416'
+    eu-west-3:
+      AccountId: '009996457667'
+    eu-central-1:
+      AccountId: '054676820928'
+    eu-north-1:
+      AccountId: '897822967062'
+    ap-southeast-1:
+      AccountId: '114774131450'
+    ap-southeast-2:
+      AccountId: '783225319266'
+    ap-northeast-1:
+      AccountId: '582318560864'
+    ap-northeast-2:
+      AccountId: '600734575887'
+    ap-south-1:
+      AccountId: '718504428378'
+    ca-central-1:
+      AccountId: '985666609251'
+
+# ============================================================
+# Conditions
+# ============================================================
+
+Conditions:
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, '']]
+
+Resources:
+
+  # ============================================================
+  # KMS — Chave de Criptografia Gerenciada pelo Cliente
+  # ============================================================
+
+  # Uma unica CMK (Customer Managed Key) para todos os recursos que precisam
+  # de criptografia at-rest gerenciada: Log Groups, SNS e ECR.
+  # CMK e exigido por PCI-DSS, SOC2 e LGPD quando voce precisa demonstrar
+  # controle sobre quem pode descriptografar dados sensiveis — com chave AWS-managed,
+  # a AWS tem acesso teorico; com CMK, somente quem a key policy autorizar.
+  LogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK para CloudWatch Logs, SNS e ECR — internet-brasil-prod
+      # Rotacao automatica anual da chave criptografica.
+      # Mesmo com rotacao, dados antigos continuam descriptografaveis (AWS guarda versoes antigas).
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # A conta root precisa de acesso total para recuperar a chave em caso de emergencia
+          # e para delegar permissoes via IAM policies.
+          - Sid: AllowRootAccountFullControl
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+          # CloudWatch Logs precisa de permissao explicita para usar a CMK ao criptografar
+          # e descriptografar entradas de log. A condicao EncryptionContext restringe o uso
+          # apenas a log groups desta conta e regiao — evita uso indevido em outras contas.
+          - Sid: AllowCloudWatchLogsEncryption
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+          # SNS precisa gerar e usar data keys para criptografar mensagens no topico.
+          # Necessario para que os CloudWatch Alarms consigam publicar alertas no topico criptografado.
+          - Sid: AllowSNSEncryption
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+
+          # CloudWatch precisa publicar mensagens no SNS (para os alarmes) usando a CMK.
+          - Sid: AllowCloudWatchPublishToSNS
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: '*'
+
+  LogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/internet-brasil-prod-logs
+      TargetKeyId: !Ref LogsKMSKey
+
+  # ============================================================
+  # VPC
+  # ============================================================
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-vpc
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Internet Gateway
+  # ============================================================
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-igw
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ============================================================
+  # Subnets Publicas
+  # ============================================================
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-public-subnet-1
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-public-subnet-2
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Subnets Privadas
+  # ============================================================
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-private-subnet-1
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.12.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-private-subnet-2
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # NAT Gateways — um por AZ para alta disponibilidade
+  # ============================================================
+
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-nat-eip-az1
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-nat-gw-az1
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NatGatewayEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-nat-eip-az2
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-nat-gw-az2
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Route Tables
+  # ============================================================
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-public-rt
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-private-rt-az1
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-private-rt-az2
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ============================================================
+  # VPC Endpoints — trafego AWS sem passar pelo NAT
+  # ============================================================
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC Endpoints Interface - permite HTTPS de dentro da VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+          Description: HTTPS de qualquer recurso dentro da VPC
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-vpce-sg
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 Gateway Endpoint — gratuito. Usado pelas layers do ECR (imagens Docker ficam no S3).
+  # A endpoint policy restringe ao account para evitar que recursos comprometidos
+  # em outras contas usem este endpoint como ponto de acesso.
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+        - !Ref PrivateRouteTable2
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAccountPrincipals
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 's3:*'
+            Resource: '*'
+
+  # ECR DKR Endpoint — pull de imagens Docker.
+  # A endpoint policy limita o uso apenas ao ECS Execution Role desta stack.
+  # Mesmo que outro recurso na conta tente usar este endpoint para acessar ECR,
+  # sera bloqueado pela policy — reduz superficie de ataque em caso de comprometimento lateral.
+  ECRDKREndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.dkr'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowECSExecutionRolePull
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ECSExecutionRole.Arn
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchCheckLayerAvailability
+            Resource: '*'
+
+  ECRAPIEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ecr.api'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowECSExecutionRoleAPI
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ECSExecutionRole.Arn
+            Action:
+              - ecr:GetAuthorizationToken
+              - ecr:DescribeRepositories
+              - ecr:DescribeImages
+            Resource: '*'
+
+  # CloudWatch Logs Endpoint — escrita de logs das tasks ECS e dos VPC Flow Logs.
+  # Aceita apenas o execution role (logs de container) e o flow logs role (logs de rede).
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.logs'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowLogDelivery
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt ECSExecutionRole.Arn
+                - !GetAtt VPCFlowLogsRole.Arn
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: '*'
+
+  # Secrets Manager Endpoint — leitura de credenciais do banco pela aplicacao.
+  # So o ECS Task Role (codigo da aplicacao) pode usar este endpoint.
+  # O Execution Role nao precisa deste endpoint — ele nao le segredos diretamente.
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+      PrivateDnsEnabled: true
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowTaskRoleSecretRead
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ECSTaskRole.Arn
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            # Restrito ao prefixo especifico do banco desta stack.
+            Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!db-internet-brasil-prod-db-*'
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - permite HTTP 80 e HTTPS 443 da internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP da internet (redirecionado para HTTPS pelo listener 301)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS da internet
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 10.0.0.0/16
+          Description: Encaminha trafego apenas para containers ECS dentro da VPC
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-alb-sg
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS - permite somente trafego do ALB na porta 8080
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Trafego do ALB na porta 8080
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Saida completa — APIs externas e servicos AWS sem endpoint dedicado
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-ecs-sg
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - permite somente trafego do ECS na porta 3306
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: MySQL do ECS na porta 3306
+      # Sem regra de egress — o RDS nunca precisa iniciar conexoes de saida.
+      Tags:
+        - Key: Name
+          Value: internet-brasil-prod-rds-sg
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # ECR Repository
+  # ============================================================
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: app
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: IMMUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      # Resource policy restringindo pull apenas ao ECS Execution Role desta stack.
+      # Sem esta policy, qualquer role na conta poderia puxar as imagens de producao —
+      # que podem conter configuracoes sensiveis baked no build.
+      # NOTA: ECSExecutionRole e referenciado aqui mas usa ARN hardcoded la embaixo
+      # para evitar dependencia circular.
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowECSExecutionRolePull
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ECSExecutionRole.Arn
+            Action:
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+              - ecr:BatchCheckLayerAvailability
+          - Sid: DenyUnauthorizedAccounts
+            Effect: Deny
+            Principal: '*'
+            Action: 'ecr:*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalAccount': !Ref AWS::AccountId
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Manter as 10 imagens versionadas mais recentes",
+                "selection": {
+                  "tagStatus": "tagged",
+                  "tagPrefixList": ["v", "sha-"],
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              },
+              {
+                "rulePriority": 2,
+                "description": "Remover imagens sem tag com mais de 7 dias",
+                "selection": {
+                  "tagStatus": "untagged",
+                  "countType": "sinceImagePushed",
+                  "countUnit": "days",
+                  "countNumber": 7
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # ALB Access Logs — S3 Bucket
+  # ============================================================
+
+  ALBAccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'internet-brasil-prod-alb-logs-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Versionamento obrigatorio quando Object Lock esta habilitado.
+      # Alem disso, permite recuperar versoes anteriores de objetos deletados acidentalmente.
+      VersioningConfiguration:
+        Status: Enabled
+      # Object Lock em modo GOVERNANCE: impede modificacao ou delecao dos logs
+      # durante o periodo de retencao (90 dias). Garante integridade das evidencias
+      # forenses em caso de incidente de seguranca.
+      # GOVERNANCE (vs COMPLIANCE): administradores com s3:BypassGovernanceRetention
+      # podem remover o lock se necessario — mais flexivel que COMPLIANCE mas ainda protegido.
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: 90
+      LifecycleConfiguration:
+        Rules:
+          - Id: GestaoCicloVidaLogs
+            Status: Enabled
+            # Apos 30 dias, move para Glacier (~80% mais barato) — logs velhos raramente sao acessados.
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: GLACIER
+            # Apos 90 dias o Object Lock expira; entao o lifecycle pode deletar.
+            # O retention de 90 dias e a expiracao em 90 dias se complementam.
+            ExpirationInDays: 91
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ALBAccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ALBAccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # Conta de servico ELB por regiao (regioes antigas como sa-east-1)
+          - Sid: ELBServiceAccountWrite
+            Effect: Allow
+            Principal:
+              AWS: !Sub
+                - 'arn:aws:iam::${ELBAccount}:root'
+                - ELBAccount: !FindInMap [ELBServiceAccounts, !Ref AWS::Region, AccountId]
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:aws:s3:::${ALBAccessLogsBucket}/AWSLogs/${AWS::AccountId}/*'
+          # Service principal moderno (regioes novas pos-2022)
+          - Sid: AWSLogDeliveryWrite
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub 'arn:aws:s3:::${ALBAccessLogsBucket}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: AWSLogDeliveryAclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: 's3:GetBucketAcl'
+            Resource: !Sub 'arn:aws:s3:::${ALBAccessLogsBucket}'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          # Bloqueia qualquer acesso via HTTP (sem TLS) ao bucket.
+          # Credenciais ou dados transmitidos sem TLS ficam expostos em texto claro.
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:aws:s3:::${ALBAccessLogsBucket}'
+              - !Sub 'arn:aws:s3:::${ALBAccessLogsBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  # ============================================================
+  # Application Load Balancer
+  # ============================================================
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: ALBAccessLogsBucketPolicy
+    Properties:
+      Name: internet-brasil-prod-alb
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: 'true'
+        - Key: access_logs.s3.bucket
+          Value: !Ref ALBAccessLogsBucket
+        - Key: access_logs.s3.prefix
+          Value: alb
+        - Key: deletion_protection.enabled
+          Value: 'true'
+        # HTTP Desync Mitigation previne ataques de HTTP Request Smuggling.
+        # "strictest" rejeita requests com headers malformados que poderiam ser usados
+        # para contornar regras do WAF ou envenenar caches de proxy reverso.
+        - Key: routing.http.desync_mitigation_mode
+          Value: strictest
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: internet-brasil-prod-tg
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+      HealthCheckEnabled: true
+      HealthCheckPath: /actuator/health
+      HealthCheckPort: '8080'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: '443'
+            Host: '#{host}'
+            Path: '/#{path}'
+            Query: '#{query}'
+            StatusCode: HTTP_301
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref ACMCertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ============================================================
+  # CloudWatch Log Groups — com criptografia KMS
+  # ============================================================
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /ecs/internet-brasil-prod
+      RetentionInDays: 90
+      # CMK garante que apenas quem tiver acesso a chave KMS possa descriptografar
+      # os logs — importante se os logs contiverem dados sensiveis da aplicacao.
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  VPCFlowLogsGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /vpc/internet-brasil-prod-flow-logs
+      RetentionInDays: 90
+      # VPC Flow Logs revelam padroes de trafego interno — informacao sensivel
+      # para investigacoes de seguranca. CMK protege contra acesso nao autorizado.
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WAFLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # O nome PRECISA comecar com "aws-waf-logs-" — exigencia da AWS para logs do WAFv2.
+      LogGroupName: aws-waf-logs-internet-brasil-prod
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt LogsKMSKey.Arn
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+
+  ECSExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: internet-brasil-prod-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # Substituida a AmazonECSTaskExecutionRolePolicy (que da acesso a TODOS os repos ECR
+        # e TODOS os log groups da conta) por uma inline policy especifica.
+        # Principio do menor privilegio: a role so consegue puxar imagens DO repositorio
+        # desta stack e escrever logs NO log group desta stack — nada mais.
+        - PolicyName: ECSExecutionInlinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # GetAuthorizationToken nao suporta restricao por recurso — e uma chamada global.
+              # Mas o pull da imagem em si e controlado pela proxima statement.
+              - Sid: ECRGetAuthToken
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: '*'
+              # Pull restrito ao repositorio desta stack.
+              # Usamos ARN construido via Sub (sem !Ref ECRRepository) para evitar
+              # dependencia circular — ECRRepository tambem referencia esta role.
+              - Sid: ECRPullFromThisRepo
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/app'
+              # Escrita restrita ao log group desta stack.
+              - Sid: CloudWatchLogsWrite
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${CloudWatchLogGroup.Arn}:*'
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: internet-brasil-prod-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerRDSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                # Restrito ao segredo especifico desta instancia RDS.
+                # O identificador do banco (internet-brasil-prod-db) esta no nome do segredo,
+                # tornando impossivel acessar segredos de outros bancos mesmo que existam na conta.
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:rds!db-internet-brasil-prod-db-*'
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  RDSEnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: internet-brasil-prod-rds-monitoring-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  VPCFlowLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: internet-brasil-prod-vpc-flow-logs-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogsCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  # Apenas as acoes estritamente necessarias para delivery de flow logs.
+                  # DescribeLogGroups e DescribeLogStreams foram removidos — o servico
+                  # de flow logs nao precisa listar grupos/streams, apenas escrever neles.
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt VPCFlowLogsGroup.Arn
+                  - !Sub '${VPCFlowLogsGroup.Arn}:log-stream:*'
+
+  # ============================================================
+  # VPC Flow Logs
+  # ============================================================
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref VPCFlowLogsGroup
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogsRole.Arn
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # WAF — Web Application Firewall
+  # ============================================================
+
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: internet-brasil-prod-waf
+      Scope: REGIONAL
+      Description: WAF para o ALB internet-brasil — OWASP, rate limit, reputacao de IP
+      DefaultAction:
+        Allow: {}
+      Rules:
+
+        # REGRA 1: Rate Limiting global por IP.
+        # Bloqueia IPs que excedam 2000 requisicoes em 5 minutos — previne brute force,
+        # credential stuffing e DDoS na camada de aplicacao.
+        # Esta e a regra mais importante para uma aplicacao internet-facing:
+        # as managed rules bloqueiam ataques por conteudo, mas sem rate limit
+        # um atacante pode testar 50.000 senhas sem ser bloqueado.
+        - Name: RateLimitGlobal
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitGlobal
+
+        # REGRA 2: Bloquear endpoints /actuator/ expostos pelo Spring Boot.
+        # /actuator/env, /actuator/heapdump, /actuator/beans expõem informacoes sensiveis
+        # sobre configuracao, variaveis de ambiente e estrutura interna da aplicacao.
+        # Apenas /actuator/health/* e permitido (necessario para health checks externos).
+        - Name: BlockActuatorEndpoints
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            AndStatement:
+              Statements:
+                - ByteMatchStatement:
+                    SearchString: /actuator/
+                    FieldToMatch:
+                      UriPath: {}
+                    TextTransformations:
+                      - Priority: 0
+                        Type: LOWERCASE
+                    PositionalConstraint: STARTS_WITH
+                - NotStatement:
+                    Statement:
+                      ByteMatchStatement:
+                        SearchString: /actuator/health
+                        FieldToMatch:
+                          UriPath: {}
+                        TextTransformations:
+                          - Priority: 0
+                            Type: LOWERCASE
+                        # STARTS_WITH cobre /actuator/health, /actuator/health/liveness
+                        # e /actuator/health/readiness (Spring Boot 2.3+)
+                        PositionalConstraint: STARTS_WITH
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockActuatorEndpoints
+
+        # REGRA 3: Lista de reputacao de IPs da AWS — gratuita e altamente efetiva.
+        # Bloqueia IPs conhecidos de botnets, scanners de vulnerabilidade, proxies
+        # anonimos e infraestrutura de ataque catalogada pela Amazon Threat Intelligence.
+        # Nenhuma configuracao necessaria — a AWS mantem e atualiza continuamente.
+        - Name: AWSManagedRulesAmazonIpReputationList
+          Priority: 5
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: IPReputationList
+
+        # REGRA 4: Regras OWASP Top 10 comuns — XSS, LFI, RFI, SSRF e outros.
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 10
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+
+        # REGRA 5: Inputs maliciosos conhecidos — Log4Shell, Spring4Shell, SSRF EC2 metadata.
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 20
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsRuleSet
+
+        # REGRA 6: SQL Injection — detecta tentativas de SQLi em body, querystring e headers.
+        - Name: AWSManagedRulesSQLiRuleSet
+          Priority: 30
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesSQLiRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: SQLiRuleSet
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: internet-brasil-prod-waf
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WAFLogGroupResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: internet-brasil-prod-waf-log-delivery
+      PolicyDocument: !Sub >-
+        {"Version":"2012-10-17","Statement":[{"Sid":"WAFLogDelivery","Effect":"Allow","Principal":{"Service":"delivery.logs.amazonaws.com"},"Action":["logs:CreateLogStream","logs:PutLogEvents"],"Resource":"${WAFLogGroup.Arn}:*","Condition":{"ArnLike":{"aws:SourceArn":"arn:aws:wafv2:${AWS::Region}:${AWS::AccountId}:regional/webacl/*"},"StringEquals":{"aws:SourceAccount":"${AWS::AccountId}"}}}]}
+
+  WAFLoggingConfiguration:
+    Type: AWS::WAFv2::LoggingConfiguration
+    DependsOn: WAFLogGroupResourcePolicy
+    Properties:
+      ResourceArn: !GetAtt WAFWebACL.Arn
+      LogDestinationConfigs:
+        - !GetAtt WAFLogGroup.Arn
+
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: ApplicationLoadBalancer
+    Properties:
+      WebACLArn: !GetAtt WAFWebACL.Arn
+      ResourceArn: !Ref ApplicationLoadBalancer
+
+  # ============================================================
+  # ECS Cluster
+  # ============================================================
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: internet-brasil-prod-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # ECS Task Definition
+  # ============================================================
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: internet-brasil-prod-task
+      Cpu: !Ref ECSTaskCpu
+      Memory: !Ref ECSTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: app
+          Image: !Sub '${ECRRepository.RepositoryUri}:${AppImageTag}'
+          Essential: true
+          # Executa como usuario nao-root (UID 1000, GID 1000).
+          # Se o container for comprometido via RCE, o atacante nao tera privilegios de root
+          # dentro do container — nao consegue instalar binarios, modificar /etc, etc.
+          # Certifique-se que o Dockerfile inclua: RUN useradd -u 1000 appuser && USER appuser
+          User: '1000:1000'
+          # Filesystem somente-leitura — o processo da aplicacao nao pode escrever
+          # no sistema de arquivos do container. Previne que malware gravado em /tmp
+          # ou /var seja executado ou persista entre reinicializacoes.
+          ReadonlyRootFilesystem: true
+          LinuxParameters:
+            # /tmp com noexec e nosuid: a aplicacao precisa de espaco temporario
+            # (ex: uploads, arquivos temporarios do JVM), mas nao pode executar
+            # binarios de /tmp nem criar arquivos com bit SUID.
+            Tmpfs:
+              - ContainerPath: /tmp
+                Size: 512
+                MountOptions:
+                  - noexec
+                  - nosuid
+                  - nodev
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CloudWatchLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: app
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - 'curl -f http://localhost:8080/actuator/health || exit 1'
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # ECS Service
+  # ============================================================
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HTTPListener
+      - HTTPSListener
+    Properties:
+      ServiceName: internet-brasil-prod-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableECSManagedTags: true
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # Auto Scaling
+  # ============================================================
+
+  ECSAutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
+    Properties:
+      MinCapacity: 2
+      MaxCapacity: 10
+      ResourceId: !Sub 'service/${ECSCluster}/${ECSService.Name}'
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ECSAutoScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: internet-brasil-prod-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSAutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 70.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  ECSMemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: internet-brasil-prod-memory-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ECSAutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: 80.0
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  # ============================================================
+  # RDS Parameter Group
+  # ============================================================
+
+  RDSParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      DBParameterGroupName: internet-brasil-prod-mysql8-params
+      Description: Parametros customizados para MySQL 8.0 em producao
+      Family: mysql8.0
+      Parameters:
+        slow_query_log: '1'
+        long_query_time: '2'
+        log_output: FILE
+        innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
+        character_set_server: utf8mb4
+        collation_server: utf8mb4_unicode_ci
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # RDS MySQL 8.0
+  # ============================================================
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group para RDS MySQL nas subnets privadas
+      DBSubnetGroupName: internet-brasil-prod-db-subnet-group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: internet-brasil-prod-db
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: !Ref DBMasterUsername
+      ManageMasterUserPassword: true
+      DBParameterGroupName: !Ref RDSParameterGroup
+      AllocatedStorage: !Ref DBAllocatedStorageGB
+      StorageType: gp3
+      MaxAllocatedStorage: 500
+      MultiAZ: true
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RDSSecurityGroup
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '02:00-03:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      DeletionProtection: true
+      StorageEncrypted: true
+      AutoMinorVersionUpgrade: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RDSEnhancedMonitoringRole.Arn
+      # Exporta logs do MySQL para o CloudWatch — essencial para:
+      # 1. "error": detectar crashes, erros de autenticacao e problemas de replicacao
+      # 2. "slowquery": visibilidade das queries lentas em tempo real com alertas possiveis
+      # Sem isso, os logs ficam apenas no disco da instancia e desaparecem com ela.
+      EnableCloudwatchLogsExports:
+        - error
+        - slowquery
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ============================================================
+  # SNS — Notificacoes de Alarmes (com criptografia KMS)
+  # ============================================================
+
+  AlarmsSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: internet-brasil-prod-alarms
+      # Mensagens SNS podem conter informacoes sobre o estado de incidentes.
+      # KmsMasterKeyId criptografa as mensagens at-rest usando a CMK desta stack.
+      KmsMasterKeyId: !Ref LogsKMSKey
+      Tags:
+        - Key: Project
+          Value: internet-brasil
+        - Key: Environment
+          Value: prod
+        - Key: Owner
+          Value: thiago.melo
+        - Key: CostCenter
+          Value: TI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AlarmsSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmsSNSTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # ============================================================
+  # CloudWatch Alarms
+  # ============================================================
+
+  ALB5XXAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internet-brasil-prod-alb-5xx-errors
+      AlarmDescription: >
+        Mais de 10 erros HTTP 5XX no ALB em 5 minutos.
+        Verifique os logs do ECS (/ecs/internet-brasil-prod) e o status do Target Group.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+
+  ECSHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internet-brasil-prod-ecs-high-cpu
+      AlarmDescription: >
+        CPU media do ECS Service acima de 80% por 10 minutos consecutivos.
+      Namespace: AWS/ECS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+
+  RDSHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internet-brasil-prod-rds-high-connections
+      AlarmDescription: >
+        Conexoes no RDS acima de 40. Causa mais comum: connection pool mal configurado
+        ou vazamento de conexoes. Ajuste o threshold para o max_connections da instancia.
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 40
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+
+  RDSLowStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internet-brasil-prod-rds-low-storage
+      AlarmDescription: >
+        Menos de 5GB livres no RDS. O storage auto scaling vai expandir em breve,
+        mas verifique crescimento anormal de dados.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref RDSInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5368709120
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+
+  ALBHighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internet-brasil-prod-alb-high-latency
+      AlarmDescription: >
+        Latencia media do ALB acima de 2 segundos por 10 minutos. Verifique queries
+        lentas no RDS (Performance Insights) e uso de CPU/memoria do ECS.
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+
+  ECSLowTaskCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internet-brasil-prod-ecs-low-task-count
+      AlarmDescription: >
+        Tasks ECS em execucao abaixo de 2 por mais de 2 minutos.
+        Verifique falha no deploy, OOMKill ou problema no health check.
+      Namespace: AWS/ECS
+      MetricName: RunningTaskCount
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 2
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+
+  # Alarme de ataque ativo no WAF.
+  # Um pico de bloqueios indica ataque em andamento (SQLi, XSS, brute force, botnet).
+  # Tambem serve como sinal de falso positivo em massa — quando uma nova versao da
+  # aplicacao faz requests que o WAF interpreta como maliciosos.
+  WAFBlockedRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: internet-brasil-prod-waf-blocked-requests
+      AlarmDescription: >
+        Mais de 100 requisicoes bloqueadas pelo WAF em 5 minutos.
+        Pode ser ataque ativo (SQLi, brute force, botnet) ou falso positivo em massa.
+        Verifique os logs do WAF em CloudWatch Logs: aws-waf-logs-internet-brasil-prod.
+      Namespace: AWS/WAFV2
+      MetricName: BlockedRequests
+      Dimensions:
+        - Name: WebACL
+          Value: internet-brasil-prod-waf
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+      OKActions: !If
+        - HasAlarmEmail
+        - - !Ref AlarmsSNSTopic
+        - !Ref AWS::NoValue
+
+  # ============================================================
+  # CloudWatch Dashboard
+  # ============================================================
+
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: internet-brasil-prod
+      DashboardBody: !Sub
+        - >-
+          {"widgets":[
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{
+              "title":"ALB - Requisicoes e Erros 5XX","view":"timeSeries","stacked":false,
+              "metrics":[
+                ["AWS/ApplicationELB","RequestCount","LoadBalancer","${LBName}",{"label":"Requisicoes","stat":"Sum","period":300}],
+                ["AWS/ApplicationELB","HTTPCode_ELB_5XX_Count","LoadBalancer","${LBName}",{"label":"Erros 5XX","stat":"Sum","period":300,"color":"#d62728"}],
+                ["AWS/ApplicationELB","HTTPCode_ELB_4XX_Count","LoadBalancer","${LBName}",{"label":"Erros 4XX","stat":"Sum","period":300,"color":"#ff7f0e"}]
+              ],"region":"${AWS::Region}"}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{
+              "title":"ALB - Latencia de Resposta (p50/p95/p99)","view":"timeSeries",
+              "metrics":[
+                ["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${LBName}",{"label":"p50","stat":"p50","period":300}],
+                ["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${LBName}",{"label":"p95","stat":"p95","period":300,"color":"#ff7f0e"}],
+                ["AWS/ApplicationELB","TargetResponseTime","LoadBalancer","${LBName}",{"label":"p99","stat":"p99","period":300,"color":"#d62728"}]
+              ],"region":"${AWS::Region}","yAxis":{"left":{"label":"segundos"}}}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{
+              "title":"ECS - CPU e Memoria","view":"timeSeries",
+              "metrics":[
+                ["AWS/ECS","CPUUtilization","ClusterName","${ClusterName}","ServiceName","${ServiceName}",{"label":"CPU %","stat":"Average","period":300}],
+                ["AWS/ECS","MemoryUtilization","ClusterName","${ClusterName}","ServiceName","${ServiceName}",{"label":"Memoria %","stat":"Average","period":300,"color":"#9467bd"}]
+              ],"region":"${AWS::Region}","yAxis":{"left":{"min":0,"max":100,"label":"%"}}}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{
+              "title":"ECS - Tasks em Execucao","view":"timeSeries",
+              "metrics":[
+                ["AWS/ECS","RunningTaskCount","ClusterName","${ClusterName}","ServiceName","${ServiceName}",{"label":"Tasks","stat":"Average","period":60,"color":"#2ca02c"}]
+              ],"region":"${AWS::Region}","yAxis":{"left":{"min":0,"label":"tasks"}}}},
+            {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{
+              "title":"RDS - CPU e Conexoes","view":"timeSeries",
+              "metrics":[
+                ["AWS/RDS","CPUUtilization","DBInstanceIdentifier","${DBId}",{"label":"CPU %","stat":"Average","period":300}],
+                ["AWS/RDS","DatabaseConnections","DBInstanceIdentifier","${DBId}",{"label":"Conexoes","stat":"Average","period":300,"yAxis":"right","color":"#9467bd"}]
+              ],"region":"${AWS::Region}"}},
+            {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{
+              "title":"RDS - Storage Livre e IOPS","view":"timeSeries",
+              "metrics":[
+                ["AWS/RDS","FreeStorageSpace","DBInstanceIdentifier","${DBId}",{"label":"Storage Livre (bytes)","stat":"Average","period":300}],
+                ["AWS/RDS","ReadIOPS","DBInstanceIdentifier","${DBId}",{"label":"Read IOPS","stat":"Average","period":300,"yAxis":"right","color":"#2ca02c"}],
+                ["AWS/RDS","WriteIOPS","DBInstanceIdentifier","${DBId}",{"label":"Write IOPS","stat":"Average","period":300,"yAxis":"right","color":"#d62728"}]
+              ],"region":"${AWS::Region}"}}
+          ]}
+        - LBName: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+          ClusterName: !Ref ECSCluster
+          ServiceName: !GetAtt ECSService.Name
+          DBId: !Ref RDSInstance
+
+# ============================================================
+# Outputs
+# ============================================================
+
+Outputs:
+
+  VpcId:
+    Description: ID da VPC
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PublicSubnet1Id:
+    Description: ID da Subnet Publica 1
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1Id'
+
+  PublicSubnet2Id:
+    Description: ID da Subnet Publica 2
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2Id'
+
+  PrivateSubnet1Id:
+    Description: ID da Subnet Privada 1
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: ID da Subnet Privada 2
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2Id'
+
+  ALBDNSName:
+    Description: DNS do Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBDNSName'
+
+  ALBArn:
+    Description: ARN do Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBArn'
+
+  ALBSecurityGroupId:
+    Description: ID do Security Group do ALB
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  ECSSecurityGroupId:
+    Description: ID do Security Group do ECS
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSSecurityGroupId'
+
+  RDSSecurityGroupId:
+    Description: ID do Security Group do RDS
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSSecurityGroupId'
+
+  ECSClusterName:
+    Description: Nome do ECS Cluster
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterName'
+
+  ECSServiceName:
+    Description: Nome do ECS Service
+    Value: !GetAtt ECSService.Name
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSServiceName'
+
+  ECRRepositoryUri:
+    Description: URI do repositorio ECR — use para push no CI/CD
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${AWS::StackName}-ECRRepositoryUri'
+
+  RDSEndpoint:
+    Description: Endpoint do RDS MySQL
+    Value: !GetAtt RDSInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSEndpoint'
+
+  RDSPort:
+    Description: Porta do RDS MySQL
+    Value: !GetAtt RDSInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSPort'
+
+  RDSMasterSecretArn:
+    Description: ARN do segredo no Secrets Manager com as credenciais do banco
+    Value: !GetAtt RDSInstance.MasterUserSecret.SecretArn
+    Export:
+      Name: !Sub '${AWS::StackName}-RDSMasterSecretArn'
+
+  LogsKMSKeyArn:
+    Description: ARN da CMK usada para criptografar Log Groups, SNS e ECR
+    Value: !GetAtt LogsKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsKMSKeyArn'
+
+  WAFWebACLArn:
+    Description: ARN do WAF WebACL
+    Value: !GetAtt WAFWebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WAFWebACLArn'
+
+  ALBAccessLogsBucketName:
+    Description: Nome do bucket S3 com os access logs do ALB
+    Value: !Ref ALBAccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBAccessLogsBucketName'
+
+  AlarmsSNSTopicArn:
+    Description: ARN do topico SNS de alarmes
+    Value: !Ref AlarmsSNSTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlarmsSNSTopicArn'
